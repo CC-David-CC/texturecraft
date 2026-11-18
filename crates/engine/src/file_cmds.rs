@@ -3,14 +3,36 @@
 
 use serde_json::{Value, json};
 #[cfg(not(target_arch = "wasm32"))]
-use texturecraft_core::{NormalFormat, PROJECT_EXT};
-use texturecraft_core::{Project, TextureSet};
+use texturecraft_core::NormalFormat;
+use texturecraft_core::{PROJECT_EXT, Project, TextureSet};
 use texturecraft_formats::{ExportInput, ExportOptions, ExportedFile, FileFormat, Padding, ProjectFile};
 use texturecraft_geom::{Mesh, primitives};
 
 use crate::commands::{CommandSpec, always, bad, normal_format_param, strp, u64p};
 use crate::session::{Document, Session};
 use crate::{EngineError, Result, cmd};
+
+const ACCOUNT_PROJECT_BYTES: usize = 128 << 20;
+
+/// Receipt for the native project revision sent to account Storage.
+pub struct PreparedAccountSave {
+    project_id: u64,
+    revision: u64,
+    generation: u64,
+    prior_path: Option<String>,
+    destination: String,
+}
+
+fn account_path(cmd: &str, path: &str) -> Result<()> {
+    if path.len() > 2048
+        || ext_of(path) != PROJECT_EXT
+        || path.chars().any(|ch| ch == '\\' || ch.is_control())
+        || path.split('/').any(|part| matches!(part, "" | "." | ".."))
+    {
+        return Err(bad(cmd, "Choose an account-relative .tcraft project path."));
+    }
+    Ok(())
+}
 
 pub fn specs() -> Vec<CommandSpec> {
     vec![
@@ -225,6 +247,66 @@ impl Session {
         texturecraft_formats::save_project_bytes(&self.project_file()).map_err(fe)
     }
 
+    /// An unfinished stroke or path is still a live preview.
+    pub fn account_project_capturable(&self) -> bool {
+        !self.stroke_active() && self.path_draft.is_none()
+    }
+
+    /// Capture the editable project and all embedded assets for browser recovery.
+    pub fn capture_account_draft(&self) -> Result<Vec<u8>> {
+        if !self.account_project_capturable() {
+            return Err(bad("file.save", "Finish the active stroke or path before saving."));
+        }
+        let bytes = self.to_project_bytes()?;
+        if bytes.is_empty() || bytes.len() > ACCOUNT_PROJECT_BYTES {
+            return Err(bad("file.save", "The native project exceeds the WebOS account file size limit."));
+        }
+        Ok(bytes)
+    }
+
+    /// Capture a project for the host without adopting the destination.
+    pub fn prepare_account_save(&self, path: &str) -> Result<(PreparedAccountSave, Vec<u8>)> {
+        account_path("file.save", path)?;
+        let bytes = self.capture_account_draft()?;
+        let receipt = PreparedAccountSave {
+            project_id: self.project_id,
+            revision: self.revision,
+            generation: self.account_save_generation,
+            prior_path: self.path.clone(),
+            destination: path.to_string(),
+        };
+        Ok((receipt, bytes))
+    }
+
+    /// Accept only the acknowledged save. Later edits remain dirty.
+    pub fn adopt_account_save(&mut self, receipt: PreparedAccountSave) -> Result<()> {
+        if self.project_id != receipt.project_id || self.account_save_generation != receipt.generation || self.path != receipt.prior_path {
+            return Err(bad("file.save", "The confirmed account save belongs to a different project or save."));
+        }
+        self.path = Some(receipt.destination);
+        self.account_save_generation = self.account_save_generation.wrapping_add(1);
+        if self.revision == receipt.revision && self.account_project_capturable() {
+            self.modified = false;
+        }
+        Ok(())
+    }
+
+    /// Open native project bytes supplied by the account host.
+    pub fn open_account_project(path: Option<&str>, bytes: &[u8], recover: bool) -> Result<Self> {
+        if let Some(path) = path {
+            account_path("file.open", path)?;
+        } else if !recover {
+            return Err(bad("file.open", "Choose an account project."));
+        }
+        if bytes.is_empty() || bytes.len() > ACCOUNT_PROJECT_BYTES {
+            return Err(bad("file.open", "The native account project size is invalid."));
+        }
+        let mut session = Self::from_project_bytes(bytes)?;
+        session.path = path.map(str::to_owned);
+        session.modified = recover;
+        Ok(session)
+    }
+
     /// Render every export file for texture sets `sets` (in memory; works on the web).
     pub fn export_files(&mut self, sets: &[usize], opts: &ExportOptions) -> Result<Vec<ExportedFile>> {
         self.update();
@@ -365,6 +447,7 @@ mod native {
         texturecraft_formats::save_project(Path::new(&path), &s.project_file()).map_err(fe)?;
         if adopt {
             s.path = Some(path.clone());
+            s.account_save_generation = s.account_save_generation.wrapping_add(1);
             s.modified = false;
         }
         s.log.push(format!("Saved {path}"));
@@ -634,6 +717,43 @@ fn close(s: &mut Session, _: &Value) -> Result<Value> {
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn account_save_keeps_original_mesh_and_the_captured_layer_revision() {
+        let mesh = b"v -1 -1 0\nv 1 -1 0\nv 1 1 0\nvt 0 0\nvt 1 0\nvt 1 1\nf 1/1 2/2 3/3\n";
+        let mut session = Session::from_mesh_bytes("mesh.obj", mesh, 128, "Account mesh").unwrap();
+        let path = "3D Objects/Painted.tcraft";
+        let layer = session.selected_layer().unwrap();
+        crate::execute(&mut session, "layer.rename", &json!({"name":"Saved layer"})).unwrap();
+        let stroke = crate::execute(&mut session, "tool.strokeUv", &json!({"points":[[0.65,0.3],[0.75,0.3]]})).unwrap();
+        assert!(stroke["tiles"].as_u64().unwrap() > 0);
+        let painted = session.doc.pixels.layer(layer, texturecraft_core::Channel::BaseColor).unwrap().clone();
+        assert!(painted.allocated_count() > 0);
+        let (receipt, bytes) = session.prepare_account_save(path).unwrap();
+        let (duplicate, _) = session.prepare_account_save(path).unwrap();
+        assert!(session.modified && session.path.is_none());
+        crate::execute(&mut session, "layer.rename", &json!({"name":"Later layer"})).unwrap();
+        session.adopt_account_save(receipt).unwrap();
+        assert!(session.modified);
+        assert_eq!(session.path.as_deref(), Some(path));
+        assert!(session.adopt_account_save(duplicate).is_err());
+        assert!(session.prepare_account_save("../Painted.tcraft").is_err());
+
+        let saved = Session::open_account_project(Some(path), &bytes, false).unwrap();
+        assert!(!saved.modified);
+        assert_eq!(saved.mesh_source.as_ref().unwrap().1.as_slice(), mesh);
+        assert_eq!(saved.doc.project.layer(layer).unwrap().name, "Saved layer");
+        assert_eq!(saved.doc.pixels.layer(layer, texturecraft_core::Channel::BaseColor), Some(&painted));
+
+        let draft = session.capture_account_draft().unwrap();
+        let recovered = Session::open_account_project(Some(path), &draft, true).unwrap();
+        assert!(recovered.modified);
+        assert_eq!(recovered.doc.project.layer(layer).unwrap().name, "Later layer");
+        assert_eq!(recovered.doc.pixels.layer(layer, texturecraft_core::Channel::BaseColor), Some(&painted));
+        let (receipt, _) = session.prepare_account_save(path).unwrap();
+        session.adopt_account_save(receipt).unwrap();
+        assert!(!session.modified);
+    }
 
     /// Reimport mesh reads the mesh file again from where it was imported, so a change saved to
     /// the file since shows up (it used to re-read the project's own copy and change nothing).

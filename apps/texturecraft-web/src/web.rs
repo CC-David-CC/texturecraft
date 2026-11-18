@@ -2,10 +2,14 @@
 //! browser shortcuts the app takes over, the unsaved-changes guard on close, and startup errors
 //! shown in the page.
 
+use eframe::egui;
 use texturecraft_engine::Session;
 use texturecraft_ui_egui::TextureCraftApp;
 use wasm_bindgen::JsCast as _;
 use wasm_bindgen::closure::Closure;
+
+use crate::account::{self, AccountView};
+use crate::account_port::AccountPort;
 
 const CANVAS_ID: &str = "texturecraft_canvas";
 const LOADING_ID: &str = "texturecraft_loading";
@@ -15,14 +19,17 @@ const PROGRESS_ID: &str = "texturecraft_progress";
 pub fn start() {
     eframe::WebLogger::init(log::LevelFilter::Info).ok();
     capture_app_shortcuts();
-    guard_unsaved_changes();
-    wasm_bindgen_futures::spawn_local(async {
+    let hosted = query().trim_start_matches('?').split('&').any(|item| item == "host=webos-account");
+    if !hosted {
+        guard_unsaved_changes();
+    }
+    wasm_bindgen_futures::spawn_local(async move {
         let Some(document) = web_sys::window().and_then(|w| w.document()) else {
             log::error!("no document");
             return;
         };
         let result = match document.get_element_by_id(CANVAS_ID).and_then(|e| e.dyn_into::<web_sys::HtmlCanvasElement>().ok()) {
-            Some(canvas) => run(canvas).await,
+            Some(canvas) => run(canvas, hosted).await,
             None => Err(format!("the page has no <canvas id=\"{CANVAS_ID}\">")),
         };
         if let Some(el) = document.get_element_by_id(LOADING_ID) {
@@ -39,10 +46,17 @@ pub fn start() {
     });
 }
 
-async fn run(canvas: web_sys::HtmlCanvasElement) -> Result<(), String> {
+async fn run(canvas: web_sys::HtmlCanvasElement, hosted: bool) -> Result<(), String> {
     // The WebAssembly has downloaded and compiled when this runs.
-    step(0.5, "Preparing the sample project…").await;
-    let session = initial_session()?;
+    let (session, account) = if hosted {
+        step(0.5, "Opening the account project…").await;
+        let port = AccountPort::connect()?;
+        let (session, identity) = account::open(&port).await?;
+        (session, Some((port, identity)))
+    } else {
+        step(0.5, "Preparing the sample project…").await;
+        (initial_session()?, None)
+    };
     step(0.8, "Starting the renderer…").await;
     let mut options = eframe::WebOptions::default();
     if query().contains("webgl")
@@ -50,13 +64,22 @@ async fn run(canvas: web_sys::HtmlCanvasElement) -> Result<(), String> {
     {
         create.instance_descriptor.backends = eframe::wgpu::Backends::GL;
     }
-    eframe::WebRunner::new()
+    let port = account.as_ref().map(|(port, _)| port.clone());
+    let started = eframe::WebRunner::new()
         .start(
             canvas,
             options,
             Box::new(|cc| {
-                let mut app = TextureCraftApp::new(cc, session);
-                app.ui.windows.start = app.ui.prefs.start_window;
+                let (mut app, account) = if let Some(port) = port {
+                    port.wake_on(cc.egui_ctx.clone());
+                    let view = AccountView::new(port);
+                    let app = TextureCraftApp::new_for_account(cc, session, view.project_service(cc.egui_ctx.clone()));
+                    (app, Some(view))
+                } else {
+                    let mut app = TextureCraftApp::new(cc, session);
+                    app.ui.windows.start = app.ui.prefs.start_window;
+                    (app, None)
+                };
                 if let Some(rs) = &cc.wgpu_render_state {
                     let backend = rs.adapter.get_info().backend;
                     log::info!("TextureCraft: wgpu backend {backend:?}");
@@ -64,11 +87,59 @@ async fn run(canvas: web_sys::HtmlCanvasElement) -> Result<(), String> {
                         app.banner = Some(texturecraft_ui_egui::WEBGL_NOTICE);
                     }
                 }
-                Ok(Box::new(app))
+                Ok(Box::new(Editor { app, account }))
             }),
         )
         .await
-        .map_err(|e| e.as_string().unwrap_or_else(|| format!("{e:?}")))
+        .map_err(|e| e.as_string().unwrap_or_else(|| format!("{e:?}")));
+    if let Some((port, identity)) = account {
+        match &started {
+            Ok(()) => port.publish("started", identity, None)?,
+            Err(error) => port.startup_failed(error),
+        }
+    }
+    started
+}
+
+struct Editor {
+    app: TextureCraftApp,
+    account: Option<AccountView>,
+}
+
+impl eframe::App for Editor {
+    fn logic(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+        if let Some(account) = &mut self.account {
+            account.poll(&mut self.app);
+            if account.suspended() {
+                return;
+            }
+        }
+        self.app.logic(ctx, frame);
+        if let Some(account) = &mut self.account
+            && let Err(error) = account.publish_state(&self.app)
+        {
+            self.app.toast(error, true);
+        }
+    }
+
+    fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
+        if self.account.as_ref().is_some_and(AccountView::suspended) {
+            return;
+        }
+        self.app.ui(ui, frame);
+    }
+
+    fn persist_egui_memory(&self) -> bool {
+        self.app.persist_egui_memory()
+    }
+
+    fn auto_save_interval(&self) -> std::time::Duration {
+        self.app.auto_save_interval()
+    }
+
+    fn save(&mut self, storage: &mut dyn eframe::Storage) {
+        self.app.save(storage);
+    }
 }
 
 /// Show a startup step on the loading screen and let the browser paint it before the next

@@ -560,6 +560,11 @@ fn new_project(app: &mut TextureCraftApp, ctx: &egui::Context) {
     });
     if create {
         let new_project = app.ui.new_project.clone();
+        if app.account_project() {
+            app.ask_account_project(crate::AccountProjectRequest::New(Box::new(new_project)));
+            app.ui.windows.new_project = false;
+            return;
+        }
         let (command, mesh) = match &new_project.file {
             Some(path) => ("file.new", path.clone()),
             None => ("project.new", new_project.mesh.clone()),
@@ -1307,6 +1312,34 @@ mod tests {
         h.state_mut().ui.prefs.language = "en".into();
         h.run_steps(2);
         h
+    }
+
+    #[test]
+    fn account_file_menu_preserves_the_dirty_project_until_the_host_acts() {
+        use std::{cell::RefCell, rc::Rc};
+
+        use crate::AccountProjectRequest as Request;
+
+        let context = egui::Context::default();
+        let cc = eframe::CreationContext::_new_kittest(context.clone());
+        let session =
+            texturecraft_engine::Session::new_project("Painted", texturecraft_engine::geom::primitives::cube(1.0), "builtin:cube", None, 128).unwrap();
+        let project = session.project_id;
+        let requests = Rc::new(RefCell::new(Vec::new()));
+        let received = requests.clone();
+        let mut app = TextureCraftApp::new_for_account(&cc, session, move |request| {
+            received.borrow_mut().push(request);
+            Ok(())
+        });
+        app.run("layer.add.paint", json!({"name": "Account paint layer"})).unwrap();
+        for command in ["file.open", "file.save", "file.saveAs", "project.sample", "file.close"] {
+            crate::menus::invoke(&mut app, &context, command);
+        }
+        assert_eq!(*requests.borrow(), [Request::Open, Request::Save, Request::SaveAs, Request::Sample, Request::Close]);
+        assert!(app.run("file.close", json!({})).is_none());
+        assert_eq!(app.session.project_id, project);
+        assert!(app.session.modified && app.session.path.is_none());
+        assert!(app.ui.windows.unsaved.is_none());
     }
 
     #[test]

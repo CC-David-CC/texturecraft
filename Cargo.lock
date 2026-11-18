@@ -4480,6 +4480,7 @@ dependencies = [
  "eframe",
  "js-sys",
  "log",
+ "serde_json",
  "texturecraft-engine",
  "texturecraft-ui-egui",
  "wasm-bindgen",

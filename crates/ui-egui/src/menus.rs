@@ -137,7 +137,24 @@ pub fn invoke(app: &mut TextureCraftApp, ctx: &egui::Context, id: &str) {
         return;
     }
 
-    if matches!(id, "ui.newProject" | "file.open" | "file.close" | "project.sample")
+    if app.account_project() {
+        use crate::AccountProjectRequest as Request;
+        let request = match id {
+            "file.open" => Some(Request::Open),
+            "file.save" => Some(Request::Save),
+            "file.saveAs" => Some(Request::SaveAs),
+            "file.close" | "ui.quit" => Some(Request::Close),
+            "project.sample" => Some(Request::Sample),
+            _ => None,
+        };
+        if let Some(request) = request {
+            app.ask_account_project(request);
+            return;
+        }
+    }
+
+    if !app.account_project()
+        && matches!(id, "ui.newProject" | "file.open" | "file.close" | "project.sample")
         && crate::windows::ask_to_save(app, crate::state::Unsaved::Command(id.into()))
     {
         return;
@@ -250,7 +267,7 @@ fn menu_item(app: &mut TextureCraftApp, ctx: &egui::Context, ui: &mut egui::Ui, 
         ui.close();
     }
     #[cfg(not(target_arch = "wasm32"))]
-    if item.id == "file.open" {
+    if item.id == "file.open" && !app.account_project() {
         ui.add_enabled_ui(!app.ui.recent.is_empty(), |ui| {
             ui.menu_button(tr("Recent projects"), |ui| {
                 for path in app.ui.recent.clone() {

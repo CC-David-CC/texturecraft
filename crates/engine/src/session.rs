@@ -362,6 +362,7 @@ pub struct Session {
     pub(crate) path_steps: (Vec<crate::path_tool::PathState>, Vec<crate::path_tool::PathState>),
     pub path: Option<String>,
     pub modified: bool,
+    pub(crate) account_save_generation: u64,
     /// Bumps on every document change.
     pub revision: u64,
     /// Messages for the UI (status bar / toasts).
@@ -420,6 +421,7 @@ impl Session {
             path_steps: Default::default(),
             path: None,
             modified: false,
+            account_save_generation: 0,
             revision: 1,
             log: Vec::new(),
             depth_cache: None,

@@ -135,6 +135,10 @@ pub fn load(app: &mut TextureCraftApp, name: &str, bytes: Vec<u8>) {
         }
         return;
     }
+    if app.account_project() {
+        app.toast("Open TextureCraft projects from WebOS Files.", true);
+        return;
+    }
     let bytes = std::sync::Arc::new(bytes);
     if crate::windows::ask_to_save(app, crate::state::Unsaved::Load(name.into(), bytes.clone())) {
         return;
@@ -277,7 +281,9 @@ mod web {
         let name = project_file_name(app);
         match app.session.to_project_bytes().map_err(|e| e.to_string()).and_then(|b| download(&name, &b)) {
             Ok(()) => {
-                app.session.modified = false;
+                if !app.account_project() {
+                    app.session.modified = false;
+                }
                 app.session.log.push(format!("Saved {name}"));
                 app.toast(trf("Downloaded {name}", &[("name", &name)]), false);
             }

@@ -113,6 +113,19 @@ pub struct Toast {
     pub until: f64,
 }
 
+/// Document requests owned by the account window hosting this editor.
+#[derive(Debug, PartialEq)]
+pub enum AccountProjectRequest {
+    New(Box<state::NewProject>),
+    Sample,
+    Open,
+    Save,
+    SaveAs,
+    Close,
+}
+
+type AccountProjectHost = Box<dyn Fn(AccountProjectRequest) -> Result<(), String>>;
+
 pub struct TextureCraftApp {
     pub session: Session,
     /// A smooth move to a saved camera in progress.
@@ -184,11 +197,26 @@ pub struct TextureCraftApp {
     pub(crate) prompt_saved: bool,
     /// The resolved keymap and its key dispatcher.
     pub(crate) bindings: keymap::Bindings,
+    account_project_host: Option<AccountProjectHost>,
 }
 
 impl TextureCraftApp {
     /// The app around `session`, with the saved UI state (or defaults in the OS language) and the GPU viewport.
     pub fn new(cc: &eframe::CreationContext<'_>, session: Session) -> TextureCraftApp {
+        Self::new_with_project_host(cc, session, None)
+    }
+
+    /// An account window owns its files and its UI state. The standalone browser storage is shared
+    /// by every person using that browser profile.
+    pub fn new_for_account(
+        cc: &eframe::CreationContext<'_>,
+        session: Session,
+        host: impl Fn(AccountProjectRequest) -> Result<(), String> + 'static,
+    ) -> TextureCraftApp {
+        Self::new_with_project_host(cc, session, Some(Box::new(host)))
+    }
+
+    fn new_with_project_host(cc: &eframe::CreationContext<'_>, session: Session, account_project_host: Option<AccountProjectHost>) -> TextureCraftApp {
         theme::install(&cc.egui_ctx);
 
         // Bakes cast their rays on a GPU device of their own (created on the first bake)
@@ -197,8 +225,11 @@ impl TextureCraftApp {
         let gpu = cc.wgpu_render_state.as_ref().map(|render_state| gpu::init(render_state, &cc.egui_ctx));
 
         // The first run speaks the OS (or browser) language
-        let mut ui_store = ui_state_store::UiStateStore::new(ui_state_store::FILE.get().cloned());
-        let ui = ui_store.load(cc.storage).unwrap_or_else(|| {
+        let hosted = account_project_host.is_some();
+        let file = if hosted { None } else { ui_state_store::FILE.get().cloned() };
+        let mut ui_store = ui_state_store::UiStateStore::new(file);
+        let storage = if hosted { None } else { cc.storage };
+        let ui = ui_store.load(storage).unwrap_or_else(|| {
             let mut ui = UiState::default();
             ui.prefs.language = i18n::os_language().into();
             ui
@@ -249,12 +280,13 @@ impl TextureCraftApp {
             #[cfg(not(target_arch = "wasm32"))]
             prompt_saved: false,
             bindings: keymap::Bindings::default(),
+            account_project_host,
         };
         app.ui.rename = None;
         app.ui.windows.new_project = false;
         i18n::set_language(&app.ui.prefs.language);
         app.report_ui_storage_warning();
-        export_templates::load_library(&mut app, cc.storage);
+        export_templates::load_library(&mut app, storage);
 
         #[cfg(not(target_arch = "wasm32"))]
         {
@@ -273,8 +305,26 @@ impl TextureCraftApp {
         app
     }
 
+    pub(crate) fn account_project(&self) -> bool {
+        self.account_project_host.is_some()
+    }
+
+    pub(crate) fn ask_account_project(&mut self, request: AccountProjectRequest) -> bool {
+        let Some(host) = &self.account_project_host else { return false };
+        if let Err(error) = host(request) {
+            self.toast(error, true);
+        }
+        true
+    }
+
     /// Run an engine command, reporting errors as toasts. Returns the result on success.
     pub fn run(&mut self, id: &str, params: Value) -> Option<Value> {
+        if self.account_project()
+            && matches!(id, "file.new" | "file.open" | "file.save" | "file.saveAs" | "file.saveCopy" | "file.close" | "project.new" | "project.sample")
+        {
+            self.toast("Use the TextureCraft File menu for account projects.", true);
+            return None;
+        }
         self.ui.prefs.apply_resource_limits();
 
         // Going to a saved camera glides there; the control channel and CLI jump straight away
@@ -642,9 +692,16 @@ impl eframe::App for TextureCraftApp {
     }
 
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
+        if self.account_project() {
+            return;
+        }
         self.ui_store.save(&self.ui, storage);
         self.report_ui_storage_warning();
         export_templates::save_library(self, storage);
+    }
+
+    fn persist_egui_memory(&self) -> bool {
+        !self.account_project()
     }
 
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
