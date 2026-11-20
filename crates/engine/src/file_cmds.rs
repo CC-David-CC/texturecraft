@@ -7,8 +7,8 @@ use std::sync::Arc;
 
 use serde_json::{Value, json};
 #[cfg(not(target_arch = "wasm32"))]
-use texturecraft_core::{NormalFormat, PROJECT_EXT};
-use texturecraft_core::{Project, TextureSet};
+use texturecraft_core::NormalFormat;
+use texturecraft_core::{PROJECT_EXT, Project, TextureSet};
 use texturecraft_formats::{ExportInput, ExportOptions, ExportedFile, FileFormat, MapOverride, Padding, ProjectFile};
 use texturecraft_geom::{Mesh, primitives};
 
