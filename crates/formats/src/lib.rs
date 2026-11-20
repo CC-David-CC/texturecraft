@@ -35,21 +35,25 @@ pub mod materialx_read;
 pub mod mcmat;
 pub mod mesh_export;
 pub mod mesh_import;
+#[path = "pbr_map/mod.rs"]
+pub mod pbr_maps;
 pub mod presets;
 pub mod project_file;
+pub mod zip_read;
 
 pub use export::{
-    Dest, ExportInput, ExportOptions, ExportPreset, ExportedFile, FileFormat, MapSpec, Padding, PlannedFile, SourceRef, VirtualMap, list_outputs, render_maps,
+    Dest, ExportInput, ExportOptions, ExportPreset, ExportedFile, FileFormat, MapOverride, MapSpec, Padding, PlannedFile, SourceRef, VirtualMap, list_outputs,
+    render_maps, skip_repeated_names,
 };
-pub use image_res::{DecodedImage, coverage_png, decode_image, decode_image_within};
+pub use image_res::{DecodedImage, coverage_png, decode_cooked_image, decode_image, decode_image_within, gray16_png, gray16_resource};
 pub use mesh_export::{GlbTextures, NamedFiles, UsdExport, UsdFormat, glb_bytes, glb_export_options, obj_bytes, obj_with_mtl, usd_bytes, usd_export_options};
 pub use mesh_import::{HighPolyMesh, ImportedMesh, MeshFile, MeshReport, import_high_poly_bytes, import_mesh_bytes, mesh_report, self_contained_mesh};
 #[cfg(not(target_arch = "wasm32"))]
 pub use presets::load_preset;
-pub use presets::{builtin_preset, builtin_presets, preset_from_json, preset_to_json};
+pub use presets::{DEFAULT_PRESET, builtin_preset, builtin_presets, preset_from_json, preset_to_json};
 pub use project_file::{
-    BakePaintData, DEFAULT_PROJECT_OPEN_LIMIT_GIB, ProjectFile, load_project_bytes, project_open_limit_gib, sanitize_resource_name, save_project_bytes,
-    set_project_open_limit_gib,
+    BakePaintData, DEFAULT_PROJECT_OPEN_LIMIT_GIB, MAX_RESOURCE_NAME_LEN, ProjectFile, RamReservation, load_project_bytes, project_open_limit_gib,
+    sanitize_resource_name, save_project_bytes, set_project_open_limit_gib,
 };
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -58,7 +62,8 @@ pub use export::write_files;
 pub use mesh_import::{import_mesh, read_mesh_file};
 #[cfg(not(target_arch = "wasm32"))]
 pub use project_file::{
-    DEFAULT_RAM_PERCENT, DEFAULT_RESERVED_CORES, available_save_resources, load_project, save_project, save_ram_budget, set_save_resources,
+    DEFAULT_RAM_PERCENT, DEFAULT_RESERVED_CORES, available_save_resources, configured_ram_budget, load_project, save_project, save_ram_budget,
+    set_save_resources,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -116,15 +121,20 @@ pub(crate) fn read_capped(path: &std::path::Path, cap: u64) -> Result<Vec<u8>> {
 #[cfg(not(target_arch = "wasm32"))]
 pub(crate) fn create_temp(path: &std::path::Path) -> Result<(std::path::PathBuf, std::fs::File)> {
     let parent = path.parent().unwrap_or_else(|| std::path::Path::new("."));
-    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("out");
-    for attempt in 0..100u32 {
-        let tmp = parent.join(format!(".{name}.{}.{attempt}.tmp", std::process::id()));
-        match std::fs::OpenOptions::new().write(true).create_new(true).open(&tmp) {
-            Ok(file) => return Ok((tmp, file)),
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(e) => return Err(e.into()),
+    let name = path.file_name().and_then(|name| name.to_str()).unwrap_or("out");
+
+    // Bound retries when stale files or concurrent writers occupy candidate names
+    const MAX_TEMP_ATTEMPTS: u32 = 100;
+
+    for attempt in 0..MAX_TEMP_ATTEMPTS {
+        let temporary_path = parent.join(format!(".{name}.{}.{attempt}.tmp", std::process::id()));
+        match std::fs::OpenOptions::new().write(true).create_new(true).open(&temporary_path) {
+            Ok(file) => return Ok((temporary_path, file)),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error.into()),
         }
     }
+
     Err(FormatError::Io(std::io::Error::new(std::io::ErrorKind::AlreadyExists, "could not create a temporary file")))
 }
 
@@ -132,14 +142,17 @@ pub(crate) fn create_temp(path: &std::path::Path) -> Result<(std::path::PathBuf,
 #[cfg(not(target_arch = "wasm32"))]
 pub fn write_atomic(path: &std::path::Path, bytes: &[u8]) -> Result<()> {
     use std::io::Write;
-    let (tmp, mut file) = create_temp(path)?;
-    let res = file.write_all(bytes).and_then(|_| file.sync_all());
+
+    let (temporary_path, mut file) = create_temp(path)?;
+    let result = file.write_all(bytes).and_then(|_| file.sync_all());
     drop(file);
-    let res = res.and_then(|_| std::fs::rename(&tmp, path));
-    if res.is_err() {
-        let _ = std::fs::remove_file(&tmp);
+
+    let result = result.and_then(|_| std::fs::rename(&temporary_path, path));
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temporary_path);
     }
-    Ok(res?)
+
+    Ok(result?)
 }
 
 #[cfg(all(test, unix))]
@@ -148,17 +161,20 @@ mod atomic_tests {
 
     #[test]
     fn write_atomic_does_not_follow_a_planted_temp_symlink() -> std::io::Result<()> {
-        let dir = std::env::temp_dir().join(format!("tc-atomic-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir)?;
-        let target = dir.join("out.png");
-        let victim = dir.join("victim.txt");
+        let directory = std::env::temp_dir().join(format!("tc-atomic-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir_all(&directory)?;
+        let target = directory.join("out.png");
+        let victim = directory.join("victim.txt");
         std::fs::write(&victim, b"safe")?;
-        std::os::unix::fs::symlink(&victim, dir.join("out.png.tmp"))?;
+        std::os::unix::fs::symlink(&victim, directory.join("out.png.tmp"))?;
+
         write_atomic(&target, b"new").map_err(std::io::Error::other)?;
+
         assert_eq!(std::fs::read(&victim)?, b"safe");
         assert_eq!(std::fs::read(&target)?, b"new");
-        let _ = std::fs::remove_dir_all(&dir);
+
+        let _ = std::fs::remove_dir_all(&directory);
         Ok(())
     }
 }

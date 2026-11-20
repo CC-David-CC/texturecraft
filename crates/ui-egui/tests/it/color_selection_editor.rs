@@ -120,7 +120,7 @@ fn pick_mode_shows_the_id_map_and_a_click_on_the_mesh_adds_its_color() {
 #[test]
 fn without_an_id_map_picking_is_off_and_a_warning_says_why() {
     let (mut harness, _) = app_with_color_selection(false);
-    let warning = format!("{} Bake an ID map (F8) to pick colors from the mesh.", egui_phosphor::regular::WARNING);
+    let warning = format!("{} Bake an ID map (Ctrl+Shift+B) to pick colors from the mesh.", egui_phosphor::regular::WARNING);
     assert!(harness.query_by_label(&warning).is_some());
 
     harness.get_by_label(&pick_color_label()).click();
@@ -245,6 +245,27 @@ fn deselection_cancels_picking_and_preserves_a_view_chosen_meanwhile() {
 }
 
 #[test]
+fn removing_an_image_during_id_picking_falls_back_to_material() {
+    let (mut harness, _) = app_with_color_selection(true);
+    let mut png = std::io::Cursor::new(Vec::new());
+    image::DynamicImage::new_rgba8(1, 1).write_to(&mut png, image::ImageFormat::Png).unwrap();
+    let session = &mut harness.state_mut().session;
+    let name = session.import_resource_bytes("preview.png", png.into_inner()).unwrap();
+    execute(session, "viewport.view", &json!({"mode": "image", "image": name})).unwrap();
+    harness.get_by_label(&pick_color_label()).click();
+    harness.run_steps(3);
+    assert_eq!(harness.state().session.view, ViewMode::MeshMap(BakedMap::Id));
+    assert!(harness.state().picking_id_color.is_some());
+
+    let app = harness.state_mut();
+    execute(&mut app.session, "resource.remove", &json!({"name": name})).unwrap();
+    texturecraft_ui_egui::id_color_pick::IdColorPick::end(app);
+
+    assert_eq!(app.session.view, ViewMode::Material);
+    assert!(app.picking_id_color.is_none());
+}
+
+#[test]
 #[ignore = "requires a GPU adapter; set TC_UI_SNAPSHOTS to save the rendered views"]
 fn color_selection_snapshots_and_quick_mask_pick() {
     let (session, _) = color_selection_session(true);
@@ -272,8 +293,11 @@ fn color_selection_snapshots_and_quick_mask_pick() {
     let center = harness.state().viewport_rect.center();
     harness.hover_at(center + egui::vec2(80.0, 0.0));
     let expected = save(&mut harness, "color-selection-picking");
+
+    execute(&mut harness.state_mut().session, "viewport.quickMask", &json!({"enabled": true})).unwrap();
     execute(&mut harness.state_mut().session, "viewport.quickMask.edit", &json!({"editing": true})).unwrap();
     let with_quick_mask = save(&mut harness, "color-selection-picking-quick-mask");
+
     assert_eq!(
         with_quick_mask.get_pixel(center.x as u32, center.y as u32),
         expected.get_pixel(center.x as u32, center.y as u32),
@@ -281,14 +305,18 @@ fn color_selection_snapshots_and_quick_mask_pick() {
     );
 
     click_at(&mut harness, center);
+
     assert!(harness.state().session.quick_mask.editing, "picking preserves quick-mask editing");
     save(&mut harness, "color-selection-quick-mask-restored");
+
     execute(&mut harness.state_mut().session, "viewport.quickMask.edit", &json!({"editing": false})).unwrap();
     harness.state_mut().ui.layout = texturecraft_ui_egui::state::ViewLayout::Only2D;
     harness.get_by_label(&pick_color_label()).click();
     save(&mut harness, "color-selection-picking-2d");
     click_at(&mut harness, center);
+
     assert!(harness.state().picking_id_color.is_none());
+
     execute(&mut harness.state_mut().session, "textureSet.meshMap.clear", &json!({"map": "id"})).unwrap();
     save(&mut harness, "color-selection-no-id-map");
 }

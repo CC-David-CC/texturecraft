@@ -54,8 +54,8 @@ async fn run(canvas: web_sys::HtmlCanvasElement, hosted: bool) -> Result<(), Str
         let (session, identity) = account::open(&port).await?;
         (session, Some((port, identity)))
     } else {
-        step(0.5, "Preparing the sample project…").await;
-        (initial_session()?, None)
+        step(0.5, "Preparing the app…").await;
+        (Session::closed().map_err(|e| e.to_string())?, None)
     };
     step(0.8, "Starting the renderer…").await;
     let mut options = eframe::WebOptions::default();
@@ -76,9 +76,7 @@ async fn run(canvas: web_sys::HtmlCanvasElement, hosted: bool) -> Result<(), Str
                     let app = TextureCraftApp::new_for_account(cc, session, view.project_service(cc.egui_ctx.clone()));
                     (app, Some(view))
                 } else {
-                    let mut app = TextureCraftApp::new(cc, session);
-                    app.ui.windows.start = app.ui.prefs.start_window;
-                    (app, None)
+                    (TextureCraftApp::new(cc, session), None)
                 };
                 if let Some(rs) = &cc.wgpu_render_state {
                     let backend = rs.adapter.get_info().backend;
@@ -162,7 +160,7 @@ async fn step(progress: f32, status: &str) {
     let _ = wasm_bindgen_futures::JsFuture::from(promise).await;
 }
 
-/// The app's shortcuts (Ctrl+S, Ctrl+O, Ctrl+D, F8…) would also trigger the browser's own
+/// The app's shortcuts (Ctrl+S, Ctrl+O, Ctrl+D, F5…) would also trigger the browser's own
 /// actions; take them first. Copy, cut and paste stay with the browser, which turns them into
 /// the clipboard events egui reads. Shortcuts the browser reserves (Ctrl+N, Ctrl+T, Ctrl+W)
 /// never reach the page.
@@ -206,18 +204,6 @@ fn guard_unsaved_changes() {
         log::warn!("couldn't guard unsaved changes on close: {e:?}");
     }
     on_unload.forget();
-}
-
-/// The baked sample project, or an empty material ball if that fails. Texture and bake sizes are
-/// kept small: the web build composites and bakes on one thread (bake 256 took ~12 s to start on a
-/// fast desktop CPU, 128 ~7.5 s).
-fn initial_session() -> Result<Session, String> {
-    texturecraft_engine::sample_session(1024, 128)
-        .or_else(|e| {
-            log::warn!("sample project failed: {e}");
-            Session::new_project("Untitled", texturecraft_engine::geom::primitives::material_ball(), "builtin:material_ball", None, 1024)
-        })
-        .map_err(|e| e.to_string())
 }
 
 fn query() -> String {

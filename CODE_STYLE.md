@@ -1,6 +1,6 @@
 # Code style
 
-Style conventions for MaterialCraft's Rust code.
+Style conventions for TextureCraft's Rust code.
 Read alongside [AGENTS.md](AGENTS.md) for repository requirements.
 
 ## Naming and Rust conventions

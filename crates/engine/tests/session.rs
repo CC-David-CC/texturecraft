@@ -247,6 +247,37 @@ fn panic_hunt() {
     }
 }
 
+/// A colour param is `[r, g, b]` in linear 0..1 or `"#rrggbb"` in sRGB, and the same digits differ
+/// between the two, so every command that takes a colour says which form is which.
+#[test]
+fn colour_params_name_their_colour_space() {
+    for spec in command_specs() {
+        if ["color?", "colors?", "Color?"].iter().any(|k| spec.params.contains(k)) {
+            assert!(spec.params.contains("linear"), "{}: {}", spec.id, spec.params);
+            let hex = spec.params.matches("\"#rrggbb\"").count();
+            assert_eq!(hex, spec.params.matches("\"#rrggbb\" sRGB").count(), "{}: {}", spec.id, spec.params);
+        }
+    }
+    // These read their colours through `color_param`, which takes both forms.
+    for id in
+        ["layer.add.fill", "layer.fill.set", "effect.add.fill", "effect.add.filter", "tool.material", "mask.add.colorSelection", "resource.text", "display.set"]
+    {
+        let spec = command_specs().iter().find(|c| c.id == id).unwrap();
+        assert!(spec.params.contains("[r,g,b] linear or \"#rrggbb\" sRGB"), "{id}: {}", spec.params);
+    }
+    let base_color = |color: Value| {
+        let mut s = session();
+        execute(&mut s, "layer.add.fill", &json!({ "color": color })).unwrap();
+        s.update();
+        s.caches[0].composite.value(Channel::BaseColor, 128, 128)
+    };
+    let hex = base_color(json!("#c8102e"));
+    let linear = base_color(json!([0.5776, 0.0052, 0.0273]));
+    assert!(hex.iter().zip(&linear).all(|(a, b)| (a - b).abs() < 2e-3), "{hex:?} {linear:?}");
+    let digits = base_color(json!([0.7843, 0.0627, 0.1804]));
+    assert!(digits[0] - hex[0] > 0.1, "{digits:?} {hex:?}");
+}
+
 #[test]
 fn copy_paste_flatten_and_resize_keep_the_look() {
     let mut s = Session::new_project("t", primitives::material_ball(), "builtin:material_ball", None, 256).unwrap();
@@ -561,6 +592,97 @@ fn background_resizes_match_the_command_and_keep_later_edits() {
     assert_eq!(b.caches[0].size, (512, 512));
 }
 
+/// A 2048 sphere set with a fill layer and an empty paint layer, a small brush, and the
+/// oracle: the composite after recompositing every covered tile from scratch.
+fn painted_set() -> Session {
+    use texturecraft_engine::geom::glam::Vec2;
+    let mut s = Session::new_project("t", primitives::sphere(1.0, 48, 24), "builtin:sphere", None, 2048).unwrap();
+    s.viewport = Vec2::new(400.0, 400.0);
+    execute(&mut s, "layer.add.fill", &json!({"color": [0.2, 0.5, 0.3], "roughness": 0.7})).unwrap();
+    execute(&mut s, "layer.add.paint", &Value::Null).unwrap();
+    execute(&mut s, "tool.brush", &json!({"size": 12, "hardness": 70, "opacity": 0.8})).unwrap();
+    // Seed the image so later strokes change existing tiles
+    execute(&mut s, "tool.stroke", &json!({"points": [[150, 160], [170, 170]]})).unwrap();
+    s.update();
+    s
+}
+
+fn full(s: &mut Session) -> texturecraft_engine::compose::Composite {
+    s.caches[0].invalidate_all();
+    s.update();
+    s.caches[0].composite.clone()
+}
+
+/// Undo and redo of `change` queue the right tiles: `Some(max)` fewer than `max` of them, matching
+/// a full recomposite once updated; `None` every covered tile.
+fn check_undo_redo(s: &mut Session, change: impl FnOnce(&mut Session), limit: Option<usize>) {
+    change(s);
+    s.update();
+    for cmd in ["edit.undo", "edit.redo"] {
+        execute(s, cmd, &Value::Null).unwrap();
+        let (dirty, covered) = (s.caches[0].dirty.len(), s.caches[0].covered_tiles.len());
+        match limit {
+            Some(max) => assert!(0 < dirty && dirty < max, "{cmd}: {dirty} of {covered} tiles dirty"),
+            None => assert_eq!(dirty, covered, "{cmd}"),
+        }
+        s.update();
+        let settled = s.caches[0].composite.clone();
+        assert_eq!(settled, full(s), "{cmd}: matches a full recomposite");
+    }
+}
+
+#[test]
+fn undo_recomposites_only_changed_tiles() {
+    let mut s = painted_set();
+    let stroke = |s: &mut Session| drop(execute(s, "tool.stroke", &json!({"points": [[150, 200], [190, 210]]})).unwrap());
+    // The stroke covers a handful of the set's 1024 tiles
+    check_undo_redo(&mut s, stroke, Some(64));
+}
+
+#[test]
+fn undo_with_a_blur_above_recomposites_everything() {
+    use texturecraft_engine::geom::glam::Vec2;
+    let mut s = Session::new_project("t", primitives::sphere(1.0, 48, 24), "builtin:sphere", None, 2048).unwrap();
+    s.viewport = Vec2::new(400.0, 400.0);
+    execute(&mut s, "layer.add.fill", &json!({"color": [0.2, 0.5, 0.3], "roughness": 0.7})).unwrap();
+    execute(&mut s, "mask.add.white", &Value::Null).unwrap();
+    execute(&mut s, "effect.add.filter", &json!({"filter": "blur", "radius": 8})).unwrap();
+    execute(&mut s, "layer.add.paint", &Value::Null).unwrap();
+    execute(&mut s, "tool.brush", &json!({"size": 12, "hardness": 70, "opacity": 0.8})).unwrap();
+    execute(&mut s, "tool.stroke", &json!({"points": [[150, 160], [170, 170]]})).unwrap();
+    s.update();
+    let stroke = |s: &mut Session| drop(execute(s, "tool.stroke", &json!({"points": [[150, 200], [190, 210]]})).unwrap());
+    check_undo_redo(&mut s, stroke, None);
+}
+
+#[test]
+fn polygon_fill_recomposites_only_changed_tiles() {
+    let mut s = painted_set();
+    execute(&mut s, "tool.material", &json!({"channel": "roughness", "value": 0.1})).unwrap();
+    execute(&mut s, "tool.stroke", &json!({"points": [[150, 240], [170, 250]]})).unwrap();
+    execute(&mut s, "tool.polygonFill", &Value::Null).unwrap();
+    s.update();
+    let tris = s.polygon_fill(texturecraft_engine::geom::glam::Vec2::new(200.0, 200.0), s.viewport).unwrap();
+    assert!(tris > 0);
+    let (dirty, covered) = (s.caches[0].dirty.len(), s.caches[0].covered_tiles.len());
+    assert!(0 < dirty && dirty < covered / 4, "{dirty} of {covered} tiles dirty after one triangle");
+    s.update();
+    let settled = s.caches[0].composite.clone();
+    assert_eq!(settled, full(&mut s));
+    execute(&mut s, "edit.undo", &Value::Null).unwrap();
+    assert!(s.caches[0].dirty.len() < covered / 4);
+    s.update();
+    let settled = s.caches[0].composite.clone();
+    assert_eq!(settled, full(&mut s));
+}
+
+#[test]
+fn undo_of_a_layer_change_recomposites_everything() {
+    let mut s = painted_set();
+    let change = |s: &mut Session| drop(execute(s, "layer.blend", &json!({"channel": "all", "opacity": 0.5})).unwrap());
+    check_undo_redo(&mut s, change, None);
+}
+
 #[test]
 fn curvature_generators_take_a_mode_and_detail_sizes() {
     let mut state = session();
@@ -587,50 +709,166 @@ fn curvature_generators_take_a_mode_and_detail_sizes() {
 }
 
 #[test]
+fn generators_take_blur_balance_and_contrast() {
+    let mut state = session();
+    execute(&mut state, "layer.add.fill", &json!({})).unwrap();
+    execute(&mut state, "mask.add.black", &Value::Null).unwrap();
+    let added = execute(&mut state, "effect.add.generator", &json!({"generator": "dirt", "blur": 0.25})).unwrap();
+    let effect = added["effect"].clone();
+
+    execute(&mut state, "effect.set", &json!({"effect": effect, "balance": 0.75, "contrast": 2.0})).unwrap();
+    let inspect = execute(&mut state, "project.inspect", &Value::Null).unwrap().to_string();
+    assert!(inspect.contains(r#""blur":0.25"#) && inspect.contains(r#""balance":0.75"#), "{inspect}");
+    assert!(inspect.contains(r#""contrast":1.0"#), "contrast is clamped to 0..1: {inspect}");
+
+    execute(&mut state, "effect.set", &json!({"effect": effect, "resolution": "custom", "customResolution": 512, "resolutionFactor": -9})).unwrap();
+    let inspect = execute(&mut state, "project.inspect", &Value::Null).unwrap().to_string();
+    assert!(inspect.contains(r#""resolution":{"custom":512,"factor":-3,"mode":"Custom"}"#), "the factor is clamped to 1/8: {inspect}");
+    assert!(execute(&mut state, "effect.set", &json!({"effect": effect, "resolution": "huge"})).is_err(), "unknown resolutions are rejected");
+}
+
+#[test]
+fn a_generator_input_reads_a_uniform_value_or_its_mesh_map_again() {
+    let mut state = session();
+    execute(&mut state, "layer.add.fill", &json!({})).unwrap();
+    execute(&mut state, "mask.add.black", &Value::Null).unwrap();
+    let effect = execute(&mut state, "effect.add.generator", &json!({"generator": "dirt"})).unwrap()["effect"].clone();
+
+    execute(&mut state, "effect.set", &json!({"effect": effect, "input": "ambientOcclusion", "inputValue": 0.25})).unwrap();
+    let inspect = execute(&mut state, "project.inspect", &Value::Null).unwrap().to_string();
+    assert!(inspect.contains(r#""inputs":{"ambientOcclusion":{"uniform":[0.25,0.25,0.25]}}"#), "{inspect}");
+
+    let wrong_input = execute(&mut state, "effect.set", &json!({"effect": effect, "input": "curvature", "inputValue": 0.5}));
+    assert!(wrong_input.is_err(), "dirt reads ambient occlusion, not curvature");
+    let missing_image = execute(&mut state, "effect.set", &json!({"effect": effect, "input": "ambientOcclusion", "inputImage": "nothing.png"}));
+    assert!(missing_image.is_err(), "the image must be a resource of the project");
+    let two_sources = execute(&mut state, "effect.set", &json!({"effect": effect, "input": "ambientOcclusion", "inputValue": 0.5, "inputBaked": true}));
+    assert!(two_sources.is_err(), "an input takes one source");
+
+    execute(&mut state, "effect.set", &json!({"effect": effect, "input": "ambientOcclusion", "inputBaked": true})).unwrap();
+    let inspect = execute(&mut state, "project.inspect", &Value::Null).unwrap().to_string();
+    assert!(!inspect.contains(r#""inputs""#), "the mesh map is read again: {inspect}");
+}
+
+#[test]
+fn changing_generator_kind_keeps_the_effect_identity_and_settings() {
+    let mut state = session();
+    execute(&mut state, "layer.add.fill", &json!({})).unwrap();
+    execute(&mut state, "mask.add.black", &Value::Null).unwrap();
+    let effect = execute(&mut state, "effect.add.generator", &json!({"generator": "dirt"})).unwrap()["effect"].as_u64().unwrap();
+    execute(&mut state, "effect.set", &json!({"effect": effect, "name": "Keep me", "opacity": 0.4, "level": 0.2})).unwrap();
+    execute(&mut state, "effect.set", &json!({"effect": effect, "input": "ambientOcclusion", "inputValue": 0.25})).unwrap();
+    let later = execute(&mut state, "effect.add.generator", &json!({"generator": "position"})).unwrap()["effect"].as_u64().unwrap();
+
+    execute(&mut state, "effect.set", &json!({"effect": effect, "generator": "ambientOcclusion"})).unwrap();
+
+    let (owner, edited) = state.doc.project.effect(texturecraft_core::LayerId(effect)).unwrap();
+    assert!(matches!(&edited.kind, texturecraft_core::EffectKind::Generator(generator)
+        if generator.kind == texturecraft_core::GeneratorKind::AmbientOcclusion
+            && generator.level == 0.2
+            && matches!(generator.inputs.get(&texturecraft_core::BakedMap::AmbientOcclusion), Some(texturecraft_core::Source::Uniform([0.25, 0.25, 0.25])))));
+    assert_eq!(edited.name, "Keep me");
+    assert_eq!(edited.opacity, 0.4);
+    let layer = state.doc.project.layer(owner).unwrap();
+    let ids: Vec<u64> = layer.mask.as_ref().unwrap().effects.iter().map(|item| item.id.0).collect();
+    assert_eq!(ids, vec![effect, later]);
+}
+
+#[test]
 fn unparseable_color_param_returns_error() {
     let mut s = session();
     let err = execute(&mut s, "layer.add.fill", &json!({"color": "#fff"})).unwrap_err();
-    assert_eq!(err.to_string(), "`layer.add.fill`: `color` must be a color ([r, g, b] linear or \"#rrggbb\")");
+    assert_eq!(err.to_string(), "`layer.add.fill`: `color` must be a color ([r, g, b] linear or \"#rrggbb\" sRGB)");
 
     let err = execute(&mut s, "layer.fill.set", &json!({"channel": "baseColor", "color": "#123"})).unwrap_err();
-    assert_eq!(err.to_string(), "`layer.fill.set`: `color` must be a color ([r, g, b] linear or \"#rrggbb\")");
+    assert_eq!(err.to_string(), "`layer.fill.set`: `color` must be a color ([r, g, b] linear or \"#rrggbb\" sRGB)");
 
     let err = execute(&mut s, "tool.material", &json!({"channel": "baseColor", "color": "invalid"})).unwrap_err();
-    assert_eq!(err.to_string(), "`tool.material`: `color` must be a color ([r, g, b] linear or \"#rrggbb\")");
+    assert_eq!(err.to_string(), "`tool.material`: `color` must be a color ([r, g, b] linear or \"#rrggbb\" sRGB)");
 
     let err = execute(&mut s, "mask.add.colorSelection", &json!({"color": "#xyz"})).unwrap_err();
-    assert_eq!(err.to_string(), "`mask.add.colorSelection`: `color` must be a color ([r, g, b] linear or \"#rrggbb\")");
+    assert_eq!(err.to_string(), "`mask.add.colorSelection`: `color` must be a color ([r, g, b] linear or \"#rrggbb\" sRGB)");
 
     let err = execute(&mut s, "display.set", &json!({"scatterColor": "#12345"})).unwrap_err();
-    assert_eq!(err.to_string(), "`display.set`: `scatterColor` must be a color ([r, g, b] linear or \"#rrggbb\")");
+    assert_eq!(err.to_string(), "`display.set`: `scatterColor` must be a color ([r, g, b] linear or \"#rrggbb\" sRGB)");
 
     let rev_before = s.revision;
     let exposure_before = s.doc.project.display.env_exposure;
     let err = execute(&mut s, "display.set", &json!({"exposure": 2.0, "scatterColor": "invalid"})).unwrap_err();
-    assert_eq!(err.to_string(), "`display.set`: `scatterColor` must be a color ([r, g, b] linear or \"#rrggbb\")");
+    assert_eq!(err.to_string(), "`display.set`: `scatterColor` must be a color ([r, g, b] linear or \"#rrggbb\" sRGB)");
     assert_eq!(s.doc.project.display.env_exposure, exposure_before);
     assert_eq!(s.revision, rev_before);
 
     let mask_before = s.tool.mask_value;
     let err = execute(&mut s, "tool.material", &json!({"maskValue": 0.25, "channel": "baseColor", "color": "invalid"})).unwrap_err();
-    assert_eq!(err.to_string(), "`tool.material`: `color` must be a color ([r, g, b] linear or \"#rrggbb\")");
+    assert_eq!(err.to_string(), "`tool.material`: `color` must be a color ([r, g, b] linear or \"#rrggbb\" sRGB)");
     assert_eq!(s.tool.mask_value, mask_before);
     assert_eq!(s.revision, rev_before);
 
     let err = execute(&mut s, "tool.material", &json!({"color": "invalid"})).unwrap_err();
-    assert_eq!(err.to_string(), "`tool.material`: `color` must be a color ([r, g, b] linear or \"#rrggbb\")");
+    assert_eq!(err.to_string(), "`tool.material`: `color` must be a color ([r, g, b] linear or \"#rrggbb\" sRGB)");
     assert_eq!(s.revision, rev_before);
 
     let err = execute(&mut s, "layer.add.fill", &json!({"color": [1e40, 0.0, 0.0]})).unwrap_err();
-    assert_eq!(err.to_string(), "`layer.add.fill`: `color` must be a color ([r, g, b] linear or \"#rrggbb\")");
+    assert_eq!(err.to_string(), "`layer.add.fill`: `color` must be a color ([r, g, b] linear or \"#rrggbb\" sRGB)");
     assert_eq!(s.revision, rev_before);
 
     let err = execute(&mut s, "layer.fill.set", &json!({"channel": "baseColor", "procedural": "noise", "color": "red"})).unwrap_err();
-    assert_eq!(err.to_string(), "`layer.fill.set`: `color` must be a color ([r, g, b] linear or \"#rrggbb\")");
+    assert_eq!(err.to_string(), "`layer.fill.set`: `color` must be a color ([r, g, b] linear or \"#rrggbb\" sRGB)");
     assert_eq!(s.revision, rev_before);
 
     assert!(execute(&mut s, "tool.cloneSource", &json!({"uv": [0.2, 0.8, 0.4]})).is_err());
     execute(&mut s, "tool.polygonFill", &Value::Null).unwrap();
     let err = execute(&mut s, "tool.click", &json!({"uv": [0.2, 0.8, 0.4]})).unwrap_err();
     assert_eq!(err.to_string(), "`tool.click`: a 2D view point needs `uv` as [u, v]");
+}
+
+#[test]
+fn resetting_a_stencil_puts_back_its_placement_only() {
+    let mut stencil = texturecraft_engine::StencilState::new("logo.png");
+    stencil.center = [0.4, -0.2];
+    stencil.scale = 2.0;
+    stencil.rotation = 30.0;
+    stencil.opacity = 0.9;
+    stencil.tile = true;
+    stencil.reset_placement();
+    assert_eq!((stencil.center, stencil.scale, stencil.rotation, stencil.opacity, stencil.tile), ([0.0, 0.0], 0.8, 0.0, 0.9, true));
+}
+
+#[test]
+fn blending_set_gives_each_channel_its_own_mode_and_opacity_in_one_undo_step() {
+    let mut s = session();
+    let layer = execute(&mut s, "layer.add.paint", &json!({})).unwrap()["layer"].as_u64().unwrap();
+    let read = |s: &Session| s.doc.project.layers[&texturecraft_engine::core::LayerId(layer)].channels.clone();
+    let before = read(&s);
+    execute(
+        &mut s,
+        "layer.blending.set",
+        &json!({"layer": layer, "channels": {"baseColor": {"mode": "Multiply", "opacity": 0.25}, "roughness": {"opacity": 0.5}}}),
+    )
+    .unwrap();
+    let after = read(&s);
+    assert_eq!((after[&Channel::BaseColor].mode, after[&Channel::BaseColor].opacity), (texturecraft_engine::core::BlendMode::Multiply, 0.25));
+    assert_eq!((after[&Channel::Roughness].mode, after[&Channel::Roughness].opacity), (before[&Channel::Roughness].mode, 0.5));
+    assert_eq!(after[&Channel::Metallic], before[&Channel::Metallic], "channels not listed stay as they were");
+    execute(&mut s, "edit.undo", &Value::Null).unwrap();
+    assert_eq!(read(&s), before, "one undo step restores every listed channel");
+    execute(&mut s, "edit.redo", &Value::Null).unwrap();
+
+    // A channel the layer has disabled stays disabled
+    execute(&mut s, "layer.blend", &json!({"layer": layer, "channel": "metallic", "enabled": false})).unwrap();
+    execute(&mut s, "layer.blending.set", &json!({"layer": layer, "channels": {"metallic": {"opacity": 0.1}}})).unwrap();
+    assert!(!read(&s).contains_key(&Channel::Metallic));
+    let stable = read(&s);
+    for bad in [
+        json!({"layer": layer}),
+        json!({"layer": layer, "channels": {"nope": {}}}),
+        json!({"layer": layer, "channels": {"baseColor": {"mode": "Multiply"}, "nope": {}}}),
+        json!({"layer": layer, "channels": {"baseColor": {"mode": "???"}}}),
+    ] {
+        assert!(execute(&mut s, "layer.blending.set", &bad).is_err(), "{bad}");
+        assert_eq!(read(&s), stable, "an error changes nothing");
+    }
+    execute(&mut s, "layer.blending.set", &json!({"layer": layer, "channels": {"baseColor": {"opacity": 2.0}, "roughness": {"opacity": -1.0}}})).unwrap();
+    assert_eq!((read(&s)[&Channel::BaseColor].opacity, read(&s)[&Channel::Roughness].opacity), (1.0, 0.0), "opacity is clamped");
 }
