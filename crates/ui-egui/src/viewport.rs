@@ -2526,7 +2526,7 @@ fn paint_2d_input(
     // A finger held on the canvas becomes a context gesture in egui before its first move.
     // Capture the brush at contact so a slow redraw or a deliberate pause still paints.
     let touch_id = response.id.with("uv_brush_touch");
-    let tracking = ui.data(|data| data.get_temp::<bool>(touch_id)).unwrap_or(false);
+    let tracking = app.session.stroke_active() && ui.data(|data| data.get_temp::<bool>(touch_id)).unwrap_or(false);
     let (contact, released, interrupted) = ui.input(|input| {
         (
             input.any_touches() && input.pointer.primary_pressed(),
@@ -2561,7 +2561,7 @@ fn paint_2d_input(
                 Err(error) => app.toast(error.to_string(), true),
             }
         }
-    } else if (tracking || response.dragged_by(PointerButton::Primary))
+    } else if (if tracking { ui.input(|input| input.pointer.delta() != egui::Vec2::ZERO) } else { response.dragged_by(PointerButton::Primary) })
         && app.session.stroke_active()
         && let Some(pointer) = if tracking { ui.input(|input| input.pointer.interact_pos()) } else { response.interact_pointer_pos() }
     {
