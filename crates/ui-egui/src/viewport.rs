@@ -2523,13 +2523,36 @@ fn paint_2d_input(
     // Where the stroke under way is; it becomes the line start only when the stroke finishes
     let stroke_end = ui.scope_id().with("paint_2d_stroke_end");
 
-    if response.drag_started_by(PointerButton::Primary) || response.clicked_by(PointerButton::Primary) {
+    // A finger held on the canvas becomes a context gesture in egui before its first move.
+    // Capture the brush at contact so a slow redraw or a deliberate pause still paints.
+    let touch_id = response.id.with("uv_brush_touch");
+    let tracking = ui.data(|data| data.get_temp::<bool>(touch_id)).unwrap_or(false);
+    let (contact, released, interrupted) = ui.input(|input| {
+        (
+            input.any_touches() && input.pointer.primary_pressed(),
+            input.pointer.primary_released(),
+            input.multi_touch().is_some()
+                || input.raw.events.iter().any(|event| matches!(event, egui::Event::Touch { phase: egui::TouchPhase::Cancel, .. })),
+        )
+    });
+    if interrupted {
+        if tracking {
+            app.session.cancel_stroke();
+            ui.data_mut(|data| data.remove::<bool>(touch_id));
+        }
+        return;
+    }
+    let starts_touch = contact && response.is_pointer_button_down_on();
+    if !tracking && (starts_touch || response.drag_started_by(PointerButton::Primary) || response.clicked_by(PointerButton::Primary)) {
         let line_start = app.last_paint_uv.filter(|_| shift).and_then(|point| point.uv_for(&app.session));
         if let Some(pointer) = response.interact_pointer_pos() {
             let from = line_start.filter(|_| snap).map(|start| to_screen(start.x, start.y));
             let uv = to_uv(snapped_end(from, pointer));
             match app.session.begin_stroke_uv(line_start.unwrap_or(uv), pressure) {
                 Ok(()) => {
+                    if starts_touch {
+                        ui.data_mut(|data| data.insert_temp(touch_id, true));
+                    }
                     if line_start.is_some() {
                         app.session.continue_stroke_uv(uv, pressure);
                     }
@@ -2538,9 +2561,9 @@ fn paint_2d_input(
                 Err(error) => app.toast(error.to_string(), true),
             }
         }
-    } else if response.dragged_by(PointerButton::Primary)
+    } else if (tracking || response.dragged_by(PointerButton::Primary))
         && app.session.stroke_active()
-        && let Some(pointer) = response.interact_pointer_pos()
+        && let Some(pointer) = if tracking { ui.input(|input| input.pointer.interact_pos()) } else { response.interact_pointer_pos() }
     {
         let uv = to_uv(pointer);
         app.session.continue_stroke_uv(uv, pressure);
@@ -2548,7 +2571,8 @@ fn paint_2d_input(
     }
 
     // Escape cancels the stroke and ends the drag without a primary release, so a cancelled stroke never gets here
-    if response.clicked_by(PointerButton::Primary) || response.drag_stopped_by(PointerButton::Primary) {
+    if (tracking && released) || (!tracking && (response.clicked_by(PointerButton::Primary) || response.drag_stopped_by(PointerButton::Primary))) {
+        ui.data_mut(|data| data.remove::<bool>(touch_id));
         let finishing = app.session.stroke_active();
         match app.session.end_stroke() {
             Ok(()) if finishing => {
@@ -2737,6 +2761,35 @@ mod tests {
 
         let star = BrushSettings { alpha: BrushAlpha::Star, ..square };
         assert!(cursor_outline(&star, 1.0).iter().all(|point| (point.length() - 1.0).abs() < 1e-3), "only the Round alpha has a roundness");
+    }
+
+    #[test]
+    fn a_held_touch_paints_before_the_finger_moves() {
+        let _language = crate::i18n::TEST_LANGUAGE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let session = Session::new_project("Held touch", texturecraft_engine::geom::primitives::plane(2.0, 4), "test", None, 128).unwrap();
+        let mut harness = egui_kittest::Harness::builder().with_size(vec2(820.0, 1180.0)).build_eframe(|context| TextureCraftApp::new(context, session));
+        harness.state_mut().ui.layout = ViewLayout::Only3D;
+        harness.run_steps(2);
+        let start = harness.state().viewport_rect.center();
+        let end = start + vec2(25.0, 0.0);
+        harness.state_mut().ui.layout = ViewLayout::Only2D;
+        harness.run_steps(2);
+        let history = harness.state().session.history_labels().len();
+        let touch = |phase, pos| egui::Event::Touch { device_id: egui::TouchDeviceId(1), id: egui::TouchId(1), phase, pos, force: None };
+        let button = |pressed, pos| egui::Event::PointerButton { pos, button: PointerButton::Primary, pressed, modifiers: egui::Modifiers::NONE };
+
+        harness.input_mut().time = Some(10.0);
+        harness.input_mut().events.extend([button(true, start), touch(egui::TouchPhase::Start, start)]);
+        harness.step();
+        harness.input_mut().time = Some(12.0);
+        harness.step();
+        harness.input_mut().events.extend([egui::Event::PointerMoved(end), touch(egui::TouchPhase::Move, end)]);
+        harness.step();
+        harness.input_mut().events.extend([button(false, end), egui::Event::PointerGone, touch(egui::TouchPhase::End, end)]);
+        harness.step();
+
+        assert!(!harness.state().session.stroke_active());
+        assert_eq!(harness.state().session.history_labels().len(), history + 1, "the finger creates one undoable stroke");
     }
 
     #[test]
